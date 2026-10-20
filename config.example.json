@@ -5,5 +5,7 @@
   "SteamExe": "C:\\Program Files (x86)\\Steam\\steam.exe",
   "GitExe": "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
   "SteamUri": "steam://rungameid/4732690",
-  "EpicUri": "com.epicgames.launcher://apps/14d53b5d3fcb4526a69d59f35c9dd28f%3A6838c695288a4fcea4486285edebcfdf%3Abcd55b0d87c245dd867f5b1bd496f1df?action=launch&silent=true"
+  "EpicUri": "com.epicgames.launcher://apps/14d53b5d3fcb4526a69d59f35c9dd28f%3A6838c695288a4fcea4486285edebcfdf%3Abcd55b0d87c245dd867f5b1bd496f1df?action=launch&silent=true",
+  "HistoryLimit": 3,
+  "MaxSnapshotBytes": 8589934592
 }

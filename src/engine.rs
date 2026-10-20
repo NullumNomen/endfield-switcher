@@ -7,7 +7,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -18,6 +18,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::GetDiskFreeSpaceExW,
     System::Diagnostics::ToolHelp::*,
     UI::Shell::ShellExecuteW,
 };
@@ -33,6 +34,16 @@ pub struct Config {
     pub git_exe: PathBuf,
     pub steam_uri: String,
     pub epic_uri: String,
+    #[serde(default = "history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "snapshot_limit")]
+    pub max_snapshot_bytes: u64,
+}
+fn history_limit() -> usize {
+    3
+}
+fn snapshot_limit() -> u64 {
+    8 * 1024 * 1024 * 1024
 }
 fn steam_exe() -> PathBuf {
     PathBuf::from(r"C:\Program Files (x86)\Steam\steam.exe")
@@ -79,6 +90,7 @@ pub struct Engine {
     pub config: Config,
     pub store: Store,
     _lock: File,
+    _game_lock: File,
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -95,7 +107,10 @@ pub fn unique() -> String {
 }
 pub fn safe(root: &Path, relative: &str) -> Result<PathBuf> {
     ensure!(
-        !relative.is_empty() && !relative.chars().any(|c| c.is_control() || c == ':'),
+        !relative.is_empty()
+            && !relative
+                .chars()
+                .any(|c| c.is_control() || ":<>\"|?*".contains(c)),
         "清单路径含非法字符"
     );
     let rel = relative.replace('\\', "/");
@@ -106,6 +121,16 @@ pub fn safe(root: &Path, relative: &str) -> Result<PathBuf> {
         "文件路径超出游戏目录：{relative}"
     );
     for part in rel.split('/') {
+        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+        ensure!(
+            !matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            ) && !(stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9')),
+            "清单路径使用 Windows 保留设备名"
+        );
         ensure!(
             !part.ends_with(['.', ' ']) && !part.is_empty(),
             "文件路径不合法"
@@ -121,9 +146,6 @@ pub fn safe(root: &Path, relative: &str) -> Result<PathBuf> {
                 path.display()
             );
         }
-        if path == root {
-            break;
-        }
         current = path.parent();
     }
     Ok(full)
@@ -132,10 +154,71 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     fs::create_dir_all(path.parent().context("文件没有父目录")?)?;
     let tmp = path.with_extension(format!("tmp-{}", unique()));
     let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path).with_context(|| format!("保存记录失败：{}", path.display()))?;
+    let result = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path).with_context(|| format!("保存记录失败：{}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn require_space(path: &Path, bytes: u64) -> Result<()> {
+    let mut existing = path;
+    while !existing.exists() {
+        existing = existing.parent().context("无法找到磁盘路径")?;
+    }
+    let wide: Vec<_> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    ensure!(
+        ok != 0,
+        "无法查询可用磁盘空间：{}",
+        std::io::Error::last_os_error()
+    );
+    ensure!(
+        free >= bytes.saturating_add(64 * 1024 * 1024),
+        "磁盘空间不足：{} 需要约 {} MiB 并保留 64 MiB 余量",
+        path.display(),
+        bytes / 1024 / 1024
+    );
+    Ok(())
+}
+
+fn clear_directory(root: &Path, relative: &str) -> Result<()> {
+    let dir = safe(root, relative)?;
+    ensure!(
+        root.is_absolute() && dir.starts_with(root) && dir != root,
+        "拒绝清理根目录以外的路径"
+    );
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        let name = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("缓存路径不是有效 Unicode")?;
+        let path = safe(root, name)?; // Check every entry before deletion; never follow reparse points.
+        if path.is_dir() {
+            clear_directory(root, name)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    fs::remove_dir(dir)?;
     Ok(())
 }
 pub fn load<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -278,13 +361,11 @@ fn restore_steam_after(
     restart: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let result = operation();
-    if reopen {
-        if let Err(error) = restart() {
-            return match result {
-                Ok(()) => Err(error),
-                Err(original) => Err(original.context(format!("Steam 恢复失败：{error:#}"))),
-            };
-        }
+    if reopen && let Err(error) = restart() {
+        return match result {
+            Ok(()) => Err(error),
+            Err(original) => Err(original.context(format!("Steam 恢复失败：{error:#}"))),
+        };
     }
     result
 }
@@ -332,13 +413,36 @@ impl Engine {
             home.join("profiles.json")
         };
         let config: Config = load(&config_path)?;
+        ensure!(
+            config.game_root.is_absolute()
+                && config.steam_exe.is_absolute()
+                && config.steam_manifest.is_absolute()
+                && config.git_exe.is_absolute(),
+            "配置中的游戏、Steam、Git 和清单路径必须是绝对路径"
+        );
+        ensure!(
+            (1..=20).contains(&config.history_limit) && config.max_snapshot_bytes > 0,
+            "HistoryLimit 必须是 1–20，MaxSnapshotBytes 必须大于 0"
+        );
         safe(&config.game_root, "Endfield.exe")?;
+        let game_lock_path = safe(&config.game_root, ".endfield-switcher.lock")?;
+        let game_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(game_lock_path)?;
+        game_lock
+            .try_lock_exclusive()
+            .context("另一个目录中的切换器正在处理同一个游戏，请等待其操作完成")?;
+        safe(&home, "data/repository.git/config")?;
         let store = Store::open(&home, &config.git_exe)?;
         let app = Self {
             home,
             config,
             store,
             _lock: lock,
+            _game_lock: game_lock,
         };
         if app.store.reference("Steam")?.is_none() || app.store.reference("Epic")?.is_none() {
             if app.home.join("profiles.json").exists() {
@@ -350,6 +454,11 @@ impl Engine {
                     "平台快照不完整，请保留 data 目录并恢复备份"
                 );
             }
+        }
+        if !app.home.join("switch.pending.json").exists()
+            && !app.home.join("refresh.pending.json").exists()
+        {
+            app.maintain(false)?;
         }
         Ok(app)
     }
@@ -572,10 +681,11 @@ impl Engine {
         )
     }
     pub fn switch(&mut self, mode: &str) -> Result<()> {
-        ensure!(
-            mode == "steam" || mode == "epic" || mode == "Steam" || mode == "Epic",
-            "未知的平台"
-        );
+        let mode = match mode {
+            "Steam" | "steam" => "Steam",
+            "Epic" | "epic" => "Epic",
+            _ => bail!("未知的平台"),
+        };
         #[cfg(not(test))]
         let reopen = {
             let p = processes()?;
@@ -605,10 +715,16 @@ impl Engine {
         #[cfg(test)]
         let reopen = false;
         let steam_exe = self.config.steam_exe.clone();
+        let home = self.home.clone();
         restore_steam_after(
             reopen,
             || self.switch_inner(mode),
             || {
+                ensure!(
+                    !home.join("switch.pending.json").exists()
+                        && !home.join("refresh.pending.json").exists(),
+                    "存在未恢复事务，Steam 保持关闭；请先恢复文件再启动 Steam"
+                );
                 shell(&steam_exe.to_string_lossy(), "")
                     .context("文件操作已结束，但重新打开 Steam 失败，请手动打开 Steam")
             },
@@ -651,7 +767,11 @@ impl Engine {
             );
         }
         ensure!(
-            sources::steam(&self.config)?.build == target.steam_build,
+            {
+                let s = sources::steam(&self.config)?;
+                s.build == target.steam_build
+                    && (target.steam_depot.is_empty() || s.depot == target.steam_depot)
+            },
             "Steam 已更新，不能恢复旧快照"
         );
         if from == to {
@@ -669,6 +789,12 @@ impl Engine {
             .collect();
         // Stage beside the live files so replacement remains atomic even when the app is on C: and the game on D:.
         let stage = self.config.game_root.join(".endfield-switcher-stage/new");
+        let size = self.store.objects_size(&target.files)?;
+        ensure!(
+            size <= self.config.max_snapshot_bytes,
+            "目标快照超过 MaxSnapshotBytes，已停止切换"
+        );
+        require_space(&self.config.game_root, size)?;
         let mut blobs = self.store.reader()?;
         for e in &target.files {
             if let Some(oid) = &e.oid {
@@ -682,6 +808,21 @@ impl Engine {
             to: to.clone(),
             paths,
         };
+        blocked()?;
+        // Preparing large blobs can take time; reject edits made while staging.
+        for e in &previous.files {
+            ensure!(
+                hash(&safe(&self.config.game_root, &e.path)?)? == e.hash,
+                "暂存期间发现外部修改，尚未替换游戏文件：{}",
+                e.path
+            );
+        }
+        for a in &target.anchors {
+            ensure!(
+                hash(&safe(&self.config.game_root, &a.path)?)?.as_deref() == Some(&a.hash),
+                "暂存期间共享资源发生变化，已停止切换"
+            );
+        }
         atomic_json(&self.home.join("switch.pending.json"), &journal)?;
         let result = (|| -> Result<()> {
             let entries: BTreeMap<_, _> =
@@ -720,6 +861,7 @@ impl Engine {
             };
         }
         self.progress(&format!("已切换到 {mode}，快照 {}", &to[..8]));
+        self.cleanup_staging()?;
         Ok(())
     }
     pub fn recover(&self) -> Result<()> {
@@ -731,8 +873,23 @@ impl Engine {
         let journal: Journal = load(&path)?;
         let old = self.store.at(&journal.from)?;
         let new = self.store.at(&journal.to)?;
+        let expected: BTreeSet<_> = old
+            .files
+            .iter()
+            .chain(&new.files)
+            .map(|e| &e.path)
+            .collect();
         ensure!(
-            sources::steam(&self.config)?.build == old.steam_build,
+            journal.paths.len() == expected.len()
+                && journal.paths.iter().collect::<BTreeSet<_>>() == expected,
+            "恢复记录中的路径与快照不符，拒绝修改文件"
+        );
+        ensure!(
+            {
+                let s = sources::steam(&self.config)?;
+                s.build == old.steam_build
+                    && (old.steam_depot.is_empty() || s.depot == old.steam_depot)
+            },
             "游戏在中断后已更新，不能把旧快照强行恢复到新版。请保留恢复记录。"
         );
         for a in &old.anchors {
@@ -782,14 +939,88 @@ impl Engine {
         }
         self.save_active(&old.mode, &journal.from)?;
         fs::remove_file(path)?;
+        self.cleanup_staging()?;
         Ok(())
     }
     pub fn history(&self) -> Result<String> {
-        self.store.history()
+        let usage = self.store.run(&["count-objects", "-v"], None)?;
+        let kib = ["size: ", "size-pack: "]
+            .iter()
+            .filter_map(|prefix| {
+                usage
+                    .lines()
+                    .find_map(|s| s.strip_prefix(prefix))
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .sum::<u64>();
+        Ok(format!(
+            "每个平台保留最近 {} 份快照\nGit 文件约占 {:.1} MiB；差异上限 {:.1} GiB\n旧历史在无未完成事务时自动回收。\n\n{}",
+            self.config.history_limit,
+            kib as f64 / 1024.0,
+            self.config.max_snapshot_bytes as f64 / 1073741824.0,
+            self.store.history()?
+        ))
     }
     pub fn compact(&self) -> Result<()> {
         self.progress("正在压缩 Git 对象并整理差异历史…");
-        self.store.compact()
+        self.maintain(true)
+    }
+    fn cleanup_staging(&self) -> Result<()> {
+        for name in [
+            ".endfield-switcher-stage/new",
+            ".endfield-switcher-stage/removed",
+            ".endfield-switcher-stage/recovery",
+        ] {
+            clear_directory(&self.config.game_root, name)?;
+        }
+        Ok(())
+    }
+    fn maintain(&self, force: bool) -> Result<()> {
+        ensure!(
+            !self.home.join("switch.pending.json").exists()
+                && !self.home.join("refresh.pending.json").exists(),
+            "有未完成事务，禁止清理历史和恢复文件"
+        );
+        let updates = self.store.retain_latest(self.config.history_limit)?;
+        let active_path = self.home.join("active.json");
+        if active_path.exists() {
+            let mut active: Active = load(&active_path)?;
+            if let Some(id) = updates.get(&active.commit) {
+                active.commit = id.clone();
+                atomic_json(&active_path, &active)?;
+            }
+        }
+        self.cleanup_staging()?;
+        clear_directory(&self.home, "data/import-stage")?;
+        clear_directory(&self.home, "data/metadata-view")?;
+        // An observed snapshot is only needed by an active refresh journal.
+        self.store
+            .run(&["update-ref", "-d", "refs/switcher/observed"], None)?;
+        let loose = self.store.run(&["count-objects", "-v"], None)?;
+        let count = loose
+            .lines()
+            .find_map(|s| s.strip_prefix("count: "))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let loose_kib = loose
+            .lines()
+            .find_map(|s| s.strip_prefix("size: "))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if force || !updates.is_empty() || count >= 64 || loose_kib >= 65536 {
+            let pack_kib = loose
+                .lines()
+                .find_map(|s| s.strip_prefix("size-pack: "))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            require_space(
+                &self.home,
+                pack_kib.saturating_add(loose_kib).saturating_mul(1024),
+            )?;
+            self.progress("正在整理 Git 快照，回收超出保留数量的历史…");
+            self.store.compact()?;
+        }
+        Ok(())
     }
     pub fn steam_mismatches(&self) -> Result<Vec<String>> {
         let source = sources::steam(&self.config)?;
@@ -895,36 +1126,32 @@ impl Engine {
             journal.return_mode = mode.into();
         }
         atomic_json(&path, &journal)?;
-        if let Some(id) = &journal.published {
-            if self.store.reference("Steam")?.as_ref() == Some(id) {
-                let (actual, _, _) = self.actual()?;
-                if actual == "Steam" || actual == "Epic" {
-                    self.checkout(&journal.return_mode)?;
+        if let Some(id) = &journal.published
+            && self.store.reference("Steam")?.as_ref() == Some(id)
+        {
+            let (actual, _, _) = self.actual()?;
+            if actual == "Steam" || actual == "Epic" {
+                self.checkout(&journal.return_mode)?;
+            } else {
+                let observed = if let Some(id) = &journal.observed {
+                    id.clone()
                 } else {
-                    let observed = if let Some(id) = &journal.observed {
-                        id.clone()
-                    } else {
-                        ensure!(
-                            self.steam_mismatches()?.is_empty(),
-                            "已发布快照，但当前 Steam 内容还不完整，请先完成 Steam 校验"
-                        );
-                        let (_, base) = self.store.snapshot("Steam")?;
-                        let id = self.observe(&base)?;
-                        journal.observed = Some(id.clone());
-                        atomic_json(&path, &journal)?;
-                        id
-                    };
-                    self.checkout_from(
-                        &journal.return_mode,
-                        &observed,
-                        &self.store.at(&observed)?,
-                    )?;
-                }
-                fs::remove_file(path)?;
-                self.store
-                    .run(&["update-ref", "-d", "refs/switcher/observed"], None)?;
-                return Ok(());
+                    ensure!(
+                        self.steam_mismatches()?.is_empty(),
+                        "已发布快照，但当前 Steam 内容还不完整，请先完成 Steam 校验"
+                    );
+                    let (_, base) = self.store.snapshot("Steam")?;
+                    let id = self.observe(&base)?;
+                    journal.observed = Some(id.clone());
+                    atomic_json(&path, &journal)?;
+                    id
+                };
+                self.checkout_from(&journal.return_mode, &observed, &self.store.at(&observed)?)?;
             }
+            fs::remove_file(path)?;
+            self.store
+                .run(&["update-ref", "-d", "refs/switcher/observed"], None)?;
+            return Ok(());
         }
         self.progress("正在读取官方最新分发清单…");
         let mut official = Official::latest()?;
@@ -945,7 +1172,16 @@ impl Engine {
         }
         blocked()?;
         let steam = sources::steam(&self.config)?;
+        let stamp_before = self.stamp()?;
         let (sid, eid) = self.prepare(&steam, &mut official)?;
+        blocked()?;
+        let current = sources::steam(&self.config)?;
+        ensure!(
+            current.build == steam.build
+                && current.depot == steam.depot
+                && self.stamp()? == stamp_before,
+            "适配期间游戏又发生更新，尚未发布新快照，请退出启动器后重试"
+        );
         let observed = self.observe(&self.store.at(&sid)?)?;
         journal.observed = Some(observed.clone());
         atomic_json(&path, &journal)?;
@@ -957,6 +1193,7 @@ impl Engine {
         self.store
             .run(&["update-ref", "-d", "refs/switcher/observed"], None)?;
         self.progress("更新适配完成，两平台快照已保存。");
+        self.maintain(false)?;
         Ok(())
     }
     fn observe(&self, template: &Snapshot) -> Result<String> {
@@ -986,11 +1223,22 @@ impl Engine {
             .flat_map(|s| &s.files)
             .map(|e| (e.path.as_str(), e))
             .collect();
+        let old_steam = if self.store.reference("Steam")?.is_some() {
+            Some(self.store.snapshot("Steam")?.1)
+        } else {
+            None
+        };
         let paths: BTreeSet<String> = steam
             .files
             .keys()
             .chain(official.files.keys())
             .cloned()
+            .chain(
+                old_epic
+                    .iter()
+                    .chain(old_steam.iter())
+                    .flat_map(|s| s.files.iter().map(|e| e.path.clone())),
+            )
             .collect();
         let mut cases = BTreeSet::new();
         for p in &paths {
@@ -1015,6 +1263,22 @@ impl Engine {
             }
         }
         let stage = self.home.join("data/import-stage");
+        let estimate = changed
+            .iter()
+            .try_fold(0u64, |total, name| -> Result<u64> {
+                let sizes = steam
+                    .files
+                    .get(name)
+                    .map_or(0, |e| e.size)
+                    .checked_add(official.files.get(name).map_or(0, |e| e.size))
+                    .context("差异文件大小溢出")?;
+                total.checked_add(sizes).context("差异总大小溢出")
+            })?;
+        ensure!(
+            estimate <= self.config.max_snapshot_bytes,
+            "两平台差异超过 MaxSnapshotBytes（默认 8 GiB），已停止适配。请等待两平台资源同步，或确认空间后调整配置。"
+        );
+        require_space(&self.home, estimate.saturating_mul(2))?;
         let mut blobs = self.store.reader()?;
         let mut sfiles = Vec::new();
         let mut efiles = Vec::new();
@@ -1050,12 +1314,10 @@ impl Engine {
                     fs::copy(&live, &temp)?;
                     usable = true;
                 }
-                if !usable {
-                    if let Some(e) = old_map.get(name.as_str()).filter(|e| e.oid.is_some()) {
-                        blobs.extract(e.oid.as_ref().unwrap(), &temp)?;
-                        usable = temp.metadata()?.len() == meta.size
-                            && sources::file_crc(&temp)? == meta.crc;
-                    }
+                if !usable && let Some(e) = old_map.get(name.as_str()).filter(|e| e.oid.is_some()) {
+                    blobs.extract(e.oid.as_ref().unwrap(), &temp)?;
+                    usable = temp.metadata()?.len() == meta.size
+                        && sources::file_crc(&temp)? == meta.crc;
                 }
                 if !usable {
                     official.extract(name, &temp)?;
@@ -1256,13 +1518,221 @@ mod tests {
         let f = Fixture::new();
         let home = f.root.join("fresh");
         fs::create_dir_all(&home).unwrap();
-        let config: Value = load(&f.root.join("profiles.json")).unwrap();
+        let config = independent_config(&f, &home);
         atomic_json(&home.join("config.json"), &config).unwrap();
         let app = Engine::open(home).unwrap();
         let state = app.inspect().unwrap();
         assert_eq!(state.mode, "Uninitialized");
         assert!(state.needs_refresh && state.can_refresh);
         assert!(app.store.reference("Steam").unwrap().is_none());
+    }
+
+    #[test]
+    fn history_is_bounded_and_pruned_blobs_are_reclaimed() {
+        let f = Fixture::new();
+        let (_, mut steam) = f.app.store.snapshot("Steam").unwrap();
+        let (_, mut epic) = f.app.store.snapshot("Epic").unwrap();
+        let mut obsolete = String::new();
+        for i in 0..7 {
+            steam.official_package = format!("test-{i}");
+            epic.official_package = format!("test-{i}");
+            let blob = f.root.join("new-epic.bin");
+            fs::write(&blob, format!("unique epic content {i}")).unwrap();
+            let oid = f.app.store.blob(&blob).unwrap();
+            if i == 0 {
+                obsolete = oid.clone();
+            }
+            epic.files[0].oid = Some(oid);
+            epic.files[0].hash = hash(&blob).unwrap();
+            let s = f.app.store.commit(&steam).unwrap();
+            let e = f.app.store.commit(&epic).unwrap();
+            f.app.store.publish(&s, &e).unwrap();
+        }
+        let head = f.app.store.reference("Steam").unwrap().unwrap();
+        f.app.save_active("Steam", &head).unwrap();
+        f.app.compact().unwrap();
+        for mode in ["Steam", "Epic"] {
+            assert_eq!(
+                f.app
+                    .store
+                    .run(&["rev-list", "--count", branch_for_test(mode)], None)
+                    .unwrap(),
+                "3"
+            );
+        }
+        assert!(
+            f.app
+                .store
+                .run(&["cat-file", "-e", &obsolete], None)
+                .is_err()
+        );
+        assert_eq!(
+            f.app.store.snapshot("Epic").unwrap().1.official_package,
+            "test-6"
+        );
+        assert_eq!(f.app.inspect().unwrap().mode, "Steam");
+        let active: Active = load(&f.root.join("active.json")).unwrap();
+        assert_eq!(Some(active.commit), f.app.store.reference("Steam").unwrap());
+        f.app.checkout("Epic").unwrap();
+        f.app.checkout("Steam").unwrap();
+        f.app
+            .store
+            .run(&["fsck", "--full", "--no-dangling"], None)
+            .unwrap();
+    }
+    fn branch_for_test(mode: &str) -> &str {
+        if mode == "Steam" {
+            "refs/heads/steam"
+        } else {
+            "refs/heads/epic"
+        }
+    }
+    #[test]
+    fn repeated_identical_snapshots_do_not_add_history() {
+        let f = Fixture::new();
+        let (id, snapshot) = f.app.store.snapshot("Steam").unwrap();
+        for _ in 0..5 {
+            assert_eq!(f.app.store.commit(&snapshot).unwrap(), id);
+        }
+    }
+    #[test]
+    fn pending_transaction_prevents_history_and_cache_cleanup() {
+        let f = Fixture::new();
+        let temp = f.root.join("data/import-stage/keep.bin");
+        fs::create_dir_all(temp.parent().unwrap()).unwrap();
+        fs::write(&temp, "needed").unwrap();
+        atomic_json(&f.root.join("refresh.pending.json"), &json!({})).unwrap();
+        assert!(f.app.compact().is_err());
+        assert!(temp.is_file());
+    }
+    #[test]
+    fn snapshot_limit_refuses_switch_before_modifying_files() {
+        let mut f = Fixture::new();
+        f.app.config.max_snapshot_bytes = 1;
+        assert!(f.app.checkout("Epic").is_err());
+        assert_eq!(f.app.inspect().unwrap().mode, "Steam");
+        assert!(!f.root.join("switch.pending.json").exists());
+        assert!(require_space(&f.root, u64::MAX).is_err());
+    }
+    #[test]
+    fn large_object_size_query_counts_duplicate_file_contents() {
+        let f = Fixture::new();
+        let (_, s) = f.app.store.snapshot("Steam").unwrap();
+        let entry = s.files[0].clone();
+        let one = f
+            .app
+            .store
+            .objects_size(std::slice::from_ref(&entry))
+            .unwrap();
+        assert_eq!(
+            f.app.store.objects_size(&vec![entry; 2048]).unwrap(),
+            one * 2048
+        );
+    }
+    #[test]
+    fn corrupted_recovery_path_list_cannot_delete_unmanaged_files() {
+        let f = Fixture::new();
+        let (s, steam) = f.app.store.snapshot("Steam").unwrap();
+        let (e, _) = f.app.store.snapshot("Epic").unwrap();
+        let mut paths: Vec<_> = steam.files.iter().map(|e| e.path.clone()).collect();
+        paths.push("preferences.txt".into());
+        atomic_json(
+            &f.root.join("switch.pending.json"),
+            &Journal {
+                from: s,
+                to: e,
+                paths,
+            },
+        )
+        .unwrap();
+        assert!(f.app.recover().is_err());
+        assert_eq!(
+            fs::read_to_string(f.root.join("game/preferences.txt")).unwrap(),
+            "leave me"
+        );
+    }
+    #[test]
+    fn depot_change_with_same_build_refuses_old_snapshot() {
+        let f = Fixture::new();
+        let (sid, _) = f.app.store.snapshot("Steam").unwrap();
+        let (_, mut epic) = f.app.store.snapshot("Epic").unwrap();
+        epic.steam_depot = "999".into();
+        let eid = f.app.store.commit(&epic).unwrap();
+        f.app.store.publish(&sid, &eid).unwrap();
+        assert!(f.app.checkout("Epic").is_err());
+        assert_eq!(f.app.inspect().unwrap().mode, "Steam");
+    }
+    #[test]
+    fn update_removes_obsolete_managed_files_and_initializes_empty_store() {
+        let f = Fixture::new();
+        let stale = f.root.join("game/obsolete.dll");
+        fs::write(&stale, "old leftover").unwrap();
+        let (sid, _) = f.app.store.snapshot("Steam").unwrap();
+        let (_, mut epic) = f.app.store.snapshot("Epic").unwrap();
+        epic.files.push(Entry {
+            path: "obsolete.dll".into(),
+            oid: Some(f.app.store.blob(&stale).unwrap()),
+            hash: hash(&stale).unwrap(),
+        });
+        let eid = f.app.store.commit(&epic).unwrap();
+        f.app.store.publish(&sid, &eid).unwrap();
+        let steam = sources::steam(&f.app.config).unwrap();
+        let mut official = Official::fixture(&[
+            ("Endfield.exe", b"Epic new exe"),
+            ("nested/engine.dll", b"Epic new dll"),
+        ]);
+        let (s, e) = f.app.prepare(&steam, &mut official).unwrap();
+        let observed = f.app.observe(&f.app.store.at(&s).unwrap()).unwrap();
+        f.app.store.publish(&s, &e).unwrap();
+        f.app
+            .checkout_from("Steam", &observed, &f.app.store.at(&observed).unwrap())
+            .unwrap();
+        assert!(!stale.exists());
+        assert!(
+            !f.root
+                .join("game/.endfield-switcher-stage/removed")
+                .exists()
+        );
+        f.app.checkout("Epic").unwrap();
+        assert_eq!(
+            fs::read(f.root.join("game/Endfield.exe")).unwrap(),
+            b"Epic new exe"
+        );
+        f.app.checkout("Steam").unwrap();
+        let home = f.root.join("fresh-init");
+        fs::create_dir_all(&home).unwrap();
+        let config = independent_config(&f, &home);
+        atomic_json(&home.join("config.json"), &config).unwrap();
+        let fresh = Engine::open(home).unwrap();
+        let (s, e) = fresh.prepare(&steam, &mut official).unwrap();
+        let observed = fresh.observe(&fresh.store.at(&s).unwrap()).unwrap();
+        fresh.store.publish(&s, &e).unwrap();
+        fresh
+            .checkout_from("Epic", &observed, &fresh.store.at(&observed).unwrap())
+            .unwrap();
+        assert_eq!(fresh.inspect().unwrap().mode, "Epic");
+    }
+
+    fn independent_config(f: &Fixture, home: &Path) -> Value {
+        let game = home.join("game");
+        for name in sources::steam(&f.app.config).unwrap().files.keys() {
+            let to = safe(&game, name).unwrap();
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(safe(&f.app.config.game_root, name).unwrap(), to).unwrap();
+        }
+        let mut config: Value = load(&f.root.join("profiles.json")).unwrap();
+        config["GameRoot"] = json!(game);
+        config
+    }
+    #[test]
+    fn different_app_directories_cannot_operate_on_same_game_concurrently() {
+        let f = Fixture::new();
+        let home = f.root.join("second-app");
+        fs::create_dir_all(&home).unwrap();
+        let config: Value = load(&f.root.join("profiles.json")).unwrap();
+        atomic_json(&home.join("config.json"), &config).unwrap();
+        assert!(Engine::open(home).is_err());
+        assert_eq!(f.app.inspect().unwrap().mode, "Steam");
     }
 
     #[test]

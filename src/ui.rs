@@ -264,52 +264,60 @@ impl App {
         let tx = self.tx.clone();
         let command = command.to_owned();
         std::thread::spawn(move || {
-            let mut out = Outcome {
-                status: None,
-                error: None,
-                history: None,
-                launched: false,
-            };
-            match Engine::open(home) {
-                Err(e) => out.error = Some(format!("{e:#}")),
-                Ok(mut app) => {
-                    let action = match command.as_str() {
-                        "steam" => app.switch("Steam"),
-                        "epic" => app.switch("Epic"),
-                        "refresh" => app.refresh(None),
-                        "recover" => app.recover(),
-                        "launch" => app.launch().map(|_| out.launched = true),
-                        "history" => app.history().map(|s| out.history = Some(s)),
-                        _ => Ok(()),
-                    };
-                    if let Err(e) = action {
-                        out.error = Some(format!("{e:#}"));
-                    }
-                    match app.inspect() {
-                        Ok(s) => out.status = Some(s),
-                        Err(e) => {
-                            if out.error.is_none() {
-                                out.error = Some(format!("{e:#}"));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut out = Outcome {
+                    status: None,
+                    error: None,
+                    history: None,
+                    launched: false,
+                };
+                match Engine::open(home) {
+                    Err(e) => out.error = Some(format!("{e:#}")),
+                    Ok(mut app) => {
+                        let action = match command.as_str() {
+                            "steam" => app.switch("Steam"),
+                            "epic" => app.switch("Epic"),
+                            "refresh" => app.refresh(None),
+                            "recover" => app.recover(),
+                            "launch" => app.launch().map(|_| out.launched = true),
+                            "history" => app.history().map(|s| out.history = Some(s)),
+                            _ => Ok(()),
+                        };
+                        if let Err(e) = action {
+                            out.error = Some(format!("{e:#}"));
+                        }
+                        match app.inspect() {
+                            Ok(s) => out.status = Some(s),
+                            Err(e) => {
+                                if out.error.is_none() {
+                                    out.error = Some(format!("{e:#}"));
+                                }
                             }
                         }
                     }
                 }
-            }
-            let _ = tx.send(out);
+                out
+            }))
+            .unwrap_or_else(|_| Outcome {
+                status: None,
+                error: Some(
+                    "后台操作异常中止。请保留 data 和恢复记录，重新打开切换器后恢复。".into(),
+                ),
+                history: None,
+                launched: false,
+            });
+            let _ = tx.send(outcome);
         });
     }
     unsafe fn tick(&mut self, hwnd: HWND) {
         unsafe {
-            if self.busy {
-                if let Ok(p) =
+            if self.busy
+                && let Ok(p) =
                     crate::engine::load::<serde_json::Value>(&self.home.join("rust-progress.json"))
-                {
-                    if p["Time"].as_f64().unwrap_or(0.0) >= self.started {
-                        if let Some(text) = p["Message"].as_str() {
-                            self.text(3, text);
-                        }
-                    }
-                }
+                && p["Time"].as_f64().unwrap_or(0.0) >= self.started
+                && let Some(text) = p["Message"].as_str()
+            {
+                self.text(3, text);
             }
             while let Ok(out) = self.rx.try_recv() {
                 self.busy = false;
@@ -364,6 +372,12 @@ impl App {
                         && self.command == "inspect";
                 }
                 if let Some(e) = out.error {
+                    for button in &self.buttons {
+                        EnableWindow(*button, 1);
+                    }
+                    if self.home.join("switch.pending.json").exists() {
+                        ShowWindow(self.buttons[5], SW_SHOW);
+                    }
                     self.text(3, &e);
                     automatic = false;
                     self.auto_attempted = true;
@@ -473,7 +487,7 @@ pub fn run(home: PathBuf) -> Result<()> {
             hInstance: instance,
             lpszClassName: class.as_ptr(),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hIcon: LoadIconW(instance, 1usize as *const u16),
+            hIcon: LoadIconW(instance, std::ptr::without_provenance(1)),
             hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
             ..std::mem::zeroed()
         };

@@ -108,11 +108,12 @@ fn parse_vdf(text: &str) -> Result<Value> {
         ensure!(closed, "Steam 正在改写安装记录，请稍后重试");
         tokens.push(value);
     }
-    fn object(tokens: &[String], i: &mut usize, nested: bool) -> Result<Value> {
+    fn object(tokens: &[String], i: &mut usize, depth: usize) -> Result<Value> {
+        ensure!(depth <= 32, "Steam 安装记录嵌套过深");
         let mut map = serde_json::Map::new();
         while *i < tokens.len() {
             if tokens[*i] == "}" {
-                ensure!(nested, "Steam 记录多余括号");
+                ensure!(depth > 0, "Steam 记录多余括号");
                 *i += 1;
                 return Ok(Value::Object(map));
             }
@@ -121,16 +122,16 @@ fn parse_vdf(text: &str) -> Result<Value> {
             let value = tokens.get(*i).context("Steam 安装记录已截断")?;
             *i += 1;
             let value = if value == "{" {
-                object(tokens, i, true)?
+                object(tokens, i, depth + 1)?
             } else {
                 Value::String(value.clone())
             };
             ensure!(map.insert(key, value).is_none(), "Steam 记录字段重复");
         }
-        ensure!(!nested, "Steam 安装记录不完整");
+        ensure!(depth == 0, "Steam 安装记录不完整");
         Ok(Value::Object(map))
     }
-    object(&tokens, &mut 0, false)
+    object(&tokens, &mut 0, 0)
 }
 
 enum Proto<'a> {
@@ -312,7 +313,7 @@ pub fn mismatches(
                         failures.lock().unwrap().push((*name).clone());
                     }
                     let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n % 80 == 0 || n == all.len() {
+                    if n.is_multiple_of(80) || n == all.len() {
                         progress(n, all.len());
                     }
                 }
@@ -483,6 +484,46 @@ pub struct Official {
     pub files: BTreeMap<String, PackageEntry>,
 }
 impl Official {
+    #[cfg(test)]
+    pub fn fixture(entries: &[(&str, &[u8])]) -> Self {
+        use std::io::{Cursor, Write};
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(data).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        assert!(bytes.len() < 4 * 1024 * 1024);
+        let total = bytes.len() as u64;
+        let stream = HttpZip {
+            client: Client::new(),
+            parts: Vec::new(),
+            total,
+            pos: 0,
+            cache: BTreeMap::from([(0, bytes)]),
+        };
+        let mut zip = zip::ZipArchive::new(stream).unwrap();
+        let mut files = BTreeMap::new();
+        for index in 0..zip.len() {
+            let f = zip.by_index(index).unwrap();
+            files.insert(
+                f.name().into(),
+                PackageEntry {
+                    index,
+                    size: f.size(),
+                    crc: f.crc32(),
+                },
+            );
+        }
+        Self {
+            version: "test-package".into(),
+            info: json!({}),
+            zip,
+            files,
+        }
+    }
     pub fn latest() -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
         let request = json!({"seq":"1","proxy_reqs":[{"kind":"get_latest_game","get_latest_game_req":{"version":"","appcode":"YDUTE5gscDZ229CW","channel":"6","sub_channel":"9999","device_id":"endfield-rust-switcher"}}]});
@@ -577,6 +618,11 @@ mod tests {
         assert!(varint(&[128], &mut 0).is_err());
         assert!(varint(&[255; 11], &mut 0).is_err());
         assert_eq!(varint(&[172, 2], &mut 0).unwrap(), 300);
+    }
+    #[test]
+    fn deeply_nested_vdf_is_rejected_without_stack_overflow() {
+        let text = format!("{}{}", "\"nested\" { ".repeat(100), "}".repeat(100));
+        assert!(parse_vdf(&text).is_err());
     }
     #[test]
     fn steam_zero_length_file_with_zero_hash_is_valid() {
