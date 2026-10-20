@@ -1,0 +1,10 @@
+/target/
+/config.json
+/profiles.json
+/active.json
+/data/
+/*.pending.json
+/rust-progress.json
+*.log
+*.zip
+*.exe
