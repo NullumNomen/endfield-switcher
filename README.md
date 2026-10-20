@@ -56,6 +56,21 @@ cargo build --release --locked
 
 成品为 `target/release/endfield-switcher.exe`，可重命名为 `EndfieldSwitcher.exe`。`build.rs` 将 `assets/endfield.ico` 嵌入 EXE。源码包含 Cargo.lock。
 
+## GitHub Actions / 自动构建
+
+工作流：`.github/workflows/windows.yml`。
+
+- 提交到 `main`、向 `main` 提 PR：Windows x64 MSVC 环境执行格式检查、严格 Clippy、测试、Release 编译和打包。运行页面的 Artifacts 保留 14 天，可下载 EXE 和 ZIP。
+- 推送 `v*` 标签：同样通过全部检查后，自动创建或更新该标签的**草稿 Release**。
+- 手动：打开仓库 **Actions → Windows CI and draft release → Run workflow**，选择源码分支／标签并填写版本标签，例如 `v2.0.0-rc.1`。默认从所选源码构建，完成后在 Releases 中审核草稿。
+- 草稿审核后在 GitHub 点 **Publish release**，下载文件才会公开出现在 Releases。工作流本身不自动发布。
+
+每个草稿提供 `EndfieldSwitcher.exe`（直接下载）、包含图标／配置示例／文档的 ZIP、`SHA256SUMS.txt` 和 `BUILD_INFO.json`。来源信息记录实际源码提交、Rust 编译器和目标平台。发布包采用明确的文件白名单，不打包个人配置、游戏文件或 Git 游戏快照。
+
+标签基础版本必须与 Cargo.toml 一致：当前 `2.0.0` 可用 `v2.0.0` 或 `v2.0.0-rc.1`。已存在的标签必须指向本次构建的提交，否则流程停止；不会强制改写标签。已发布的 Release 不允许重打包覆盖，请升级版本号并使用新标签。草稿重跑会替换构建产物和校验文件。
+
+仅在网页上手动新建 Draft 不会启动该流程；请使用 Run workflow 或推送标签。构建无需额外 PAT，发布步骤使用本仓库临时 GITHUB_TOKEN 的 contents:write 权限，PR 只读。
+
 ## 命令行
 
 ```powershell

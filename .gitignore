@@ -1,4 +1,5 @@
 /target/
+/dist/
 /config.json
 /profiles.json
 /active.json
