@@ -2,6 +2,7 @@
 name = "endfield-switcher"
 version = "2.0.0"
 edition = "2024"
+license = "0BSD"
 
 [dependencies]
 anyhow = "1"
