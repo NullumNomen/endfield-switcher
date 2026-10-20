@@ -24,6 +24,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+  RUST_TOOLCHAIN: 1.95.0
 
 jobs:
   build:
@@ -39,11 +40,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Install stable MSVC Rust with formatting and lint tools
+      - name: Install pinned MSVC Rust with formatting and lint tools
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy
+          rustup toolchain install "${env:RUST_TOOLCHAIN}-x86_64-pc-windows-msvc" --profile minimal --component rustfmt --component clippy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default stable-x86_64-pc-windows-msvc
+          rustup default "${env:RUST_TOOLCHAIN}-x86_64-pc-windows-msvc"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version --verbose
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

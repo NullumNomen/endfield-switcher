@@ -64,7 +64,7 @@ impl BlobReader {
         ensure!(copied == size, "Git 文件对象已截断");
         let mut end = [0];
         self.output.read_exact(&mut end)?;
-        ensure!(end == [b'\n'], "Git 对象边界错误");
+        ensure!(end == *b"\n", "Git 对象边界错误");
         file.sync_all()?;
         Ok(())
     }

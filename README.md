@@ -60,7 +60,7 @@ cargo build --release --locked
 
 工作流：`.github/workflows/windows.yml`。
 
-- 提交到 `main`、向 `main` 提 PR：Windows x64 MSVC 环境执行格式检查、严格 Clippy、测试、Release 编译和打包。运行页面的 Artifacts 保留 14 天，可下载 EXE 和 ZIP。
+- 提交到 `main`、向 `main` 提 PR：固定 Rust 1.95.0 的 Windows x64 MSVC 环境执行格式检查、严格 Clippy、测试、Release 编译和打包。运行页面的 Artifacts 保留 14 天，可下载 EXE 和 ZIP。
 - 推送 `v*` 标签：同样通过全部检查后，自动创建或更新该标签的**草稿 Release**。
 - 手动：打开仓库 **Actions → Windows CI and draft release → Run workflow**，选择源码分支／标签并填写版本标签，例如 `v2.0.0-rc.1`。默认从所选源码构建，完成后在 Releases 中审核草稿。
 - 草稿审核后在 GitHub 点 **Publish release**，下载文件才会公开出现在 Releases。工作流本身不自动发布。
